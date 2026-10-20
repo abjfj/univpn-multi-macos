@@ -1,0 +1,35 @@
+# Local vendor copies, reverse-engineering material and generated clients
+/upstream/
+/research/
+/build/
+*.app/
+*.dmg
+*.pkg
+*.zip
+
+# Private VPN profiles, login records, logs and recovery data
+*.ini
+*.log
+*.pcap
+*.pcapng
+.env
+.env.*
+*.pem
+*.key
+.UniVPN/
+.UVP*/
+.multi-backups/
+snapshots/
+backups/
+
+# Python / local tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+.idea/
+.vscode/

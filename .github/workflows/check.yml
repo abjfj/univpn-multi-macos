@@ -1,0 +1,34 @@
+name: Offline checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: '3.9'
+          - os: macos-latest
+            python-version: '3.13'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Check Python syntax
+        run: python -m compileall -q univpn_multi.py gateway_routes.py network_snapshot.py tests
+      - name: Run offline tests
+        run: python -m unittest discover -s tests -v
+      - name: Check launcher syntax
+        run: sh -n vpn-new
+      - name: Check whitespace
+        run: git diff-tree --check --root HEAD
