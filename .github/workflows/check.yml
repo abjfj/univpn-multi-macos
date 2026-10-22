@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Check Python syntax
-        run: python -m compileall -q univpn_multi.py gateway_routes.py network_snapshot.py tests
+        run: python -m compileall -q univpn_multi.py univpn_profiles.py gateway_routes.py network_snapshot.py tests
       - name: Run offline tests
         run: python -m unittest discover -s tests -v
       - name: Check launcher syntax

@@ -12,7 +12,7 @@
 | `promote/UniVPNPromoteService` | `d36a2e951c52e344a414b449b41f017248d127f1234ac1e83f9b80a290a53c9e` |
 | `serviceclient/UniVPNCS` | `426a59bb1342ec5cff995581c9b3d1fbba622b7bcc623dc468a16c9b5b4f19f1` |
 
-三个文件均为 x86_64 Mach-O，样本未签名。只匹配版本号不足以安全应用固定偏移补丁，必须通过完整 SHA256、原始指令字节和身份字符串数量检查。不支持 Universal binary、原生 arm64 或其他哈希。
+三个文件均为 x86_64 Mach-O，样本未签名。上述构建规则位于 `univpn_profiles.py`，ID 为 `univpn-10781.19.0.1214-x86_64-r1`。2026-10-22 起，工具自动识别版本并从规则集合中选择唯一匹配项，每份规则有独立哈希、偏移和原始字节。只匹配版本号不足以安全应用补丁，必须通过三个核心文件的完整 SHA256、架构、Bundle 身份、原始指令字节和身份字符串数量检查。当前只有这份真实规则，不支持 Universal binary、原生 arm64 或其他未审核哈希；后续构建接入见[版本适配说明](COMPATIBILITY.md)。
 
 ## 实例身份与端口
 
@@ -61,6 +61,7 @@ Qt `SingleApplication` 从可执行文件 basename 建立 `QLocalServer`，因�
 
 - `build` 只写输出副本；校验源文件和内部链接，拒绝越界或失效链接、特殊文件及已有输出目录。不在生成目录设置 setuid，UI 暂设为 `0644`。
 - Manifest 记录完整载荷、链接目标、二进制哈希、端口和身份。它用于检测意外改动，并非开发者签名或供应链真实性证明。
+- 新 Manifest 另记实际版本、架构和来源规则 ID；旧记录可通过已存版本和源文件哈希推断规则。来源不明确的记录拒绝使用，修复时也禁止拿其他构建的原版套补丁。
 - `install` 使用 root 私有临时目录校验复制结果，设置 root:wheel 和不可组写/其他用户写的权限，后台为 `04755`，完成后发布到 `/Applications`；拒绝覆盖既有 App。
 - 已安装 App 的 `Contents/MacOS/sysconfig.ini` 是厂商可变运行数据，允许内容变化，仍检查普通文件、root:wheel 和写权限。其余文件继续完整性校验。
 - 通过 `proc_pidpath` 确认同名进程的实际路径，UI 或后台运行时拒绝重用和配置写入。无 UI、无后台时，仅确认属于本副本的孤立提权服务可用 SIGTERM 清理。

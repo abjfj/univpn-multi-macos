@@ -7,7 +7,7 @@
 在项目根目录以普通用户执行：
 
 ```sh
-python3 -m compileall -q univpn_multi.py gateway_routes.py network_snapshot.py tests
+python3 -m compileall -q univpn_multi.py univpn_profiles.py gateway_routes.py network_snapshot.py tests
 python3 -m unittest discover -s tests -v
 sh -n vpn-new
 git diff --check
@@ -18,6 +18,7 @@ git diff --check
 ## 修改约束
 
 - 新构建支持必须附带精确文件 SHA256、架构及补丁前置字节依据，不能只凭版本号扩大兼容范围。
+- 新版本规则集中在 `univpn_profiles.py`；接入步骤及验证要求见[版本适配说明](docs/COMPATIBILITY.md)。测试中的模拟版本仅用于证明规则选择与拒绝行为，不能纳入真实支持列表。
 - 保留源 App 不写入、安装拒绝覆盖、UI 普通用户启动、活动实例拒绝配置写入等防护。
 - 不跳过认证、验证码、证书验证或网关策略，不输出密码、保存的登录记录及认证报文。
 - 文件和路由修改需考虑备份、失败回滚、并发和恢复记录；优先增加覆盖这些行为的测试。

@@ -16,6 +16,8 @@ import univpn_multi as tool
 class NewWindowTests(unittest.TestCase):
     empty = {'ui': [], 'helper': [], 'backend': []}
     active = {'ui': [11], 'helper': [12], 'backend': [13]}
+    profile = tool.compatibility.BUILD_PROFILES[0]
+    source_match = ({}, profile, {'version': profile.versions[0]})
 
     def test_idle_original_is_first_and_existing_tunnels_are_not_touched(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -55,6 +57,7 @@ class NewWindowTests(unittest.TestCase):
 
     def test_dry_run_never_installs_starts_or_changes_configuration(self):
         with mock.patch.object(tool.os, 'geteuid', return_value=501), \
+                mock.patch.object(tool, 'require_source', return_value=self.source_match), \
                 mock.patch.object(tool, 'select_new_instance', return_value=(3, Path('/Applications/UVP003.app'))), \
                 mock.patch.object(tool.subprocess, 'run') as run, \
                 mock.patch.object(tool, 'prepare_instance_config') as prepare, \
@@ -132,9 +135,11 @@ class NewWindowTests(unittest.TestCase):
             staged.mkdir(parents=True)
             with mock.patch.object(tool, '__file__', str(root / 'univpn_multi.py')), \
                     mock.patch.object(tool.os, 'geteuid', return_value=501), \
+                    mock.patch.object(tool, 'require_source', return_value=self.source_match), \
                     mock.patch.object(tool, 'new_window_lock', return_value=nullcontext()), \
                     mock.patch.object(tool, 'select_new_instance', return_value=(3, app)), \
-                    mock.patch.object(tool, 'load_manifest'), \
+                    mock.patch.object(tool, 'load_manifest', return_value={
+                        'version': self.profile.versions[0], 'source_sha256': self.profile.hashes()}), \
                     mock.patch.object(tool.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, ['sudo'])) as run, \
                     mock.patch.object(tool, 'prepare_instance_config') as prepare, \
                     mock.patch.object(tool, 'inherit_original_config') as inherit, \
@@ -154,6 +159,7 @@ class NewWindowTests(unittest.TestCase):
             app = Path(temp) / 'UVP003.app'
             app.mkdir()
             with mock.patch.object(tool.os, 'geteuid', return_value=501), \
+                    mock.patch.object(tool, 'require_source', return_value=self.source_match), \
                     mock.patch.object(tool, 'new_window_lock', return_value=nullcontext()), \
                     mock.patch.object(tool, 'select_new_instance', return_value=(3, app)), \
                     mock.patch.object(tool.subprocess, 'run') as run, \
@@ -394,7 +400,7 @@ class GuardTests(unittest.TestCase):
                 tool.replace_at(b'abcd', 1, before, after)
 
     def test_unsupported_binary_is_rejected(self):
-        for relative in tool.PROFILE:
+        for relative in tool.SOURCE_FILES:
             with self.assertRaises(tool.Refused):
                 tool.patch(b'not a vendor binary', relative, 2)
 

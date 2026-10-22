@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build local, version-locked macOS UniVPN experiments. Never downloads binaries."""
+"""Auto-detect reviewed macOS UniVPN builds; refuse unknown or incompatible clients."""
 import argparse
 import ctypes
 import configparser
@@ -21,17 +21,15 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from xml.parsers.expat import ExpatError
+
+import univpn_profiles as compatibility
 
 SOURCE = Path('/Applications/UniVPN.app')
-VERSION = '10781.19.0.1214'
 PATCH_REVISION = 2
 MARKER = 'Contents/Resources/univpn-multi-manifest.json'
 RUNTIME_CONFIG = 'Contents/MacOS/sysconfig.ini'
-PROFILE = {
-    'UniVPN': ('c0fed6a4bf6d150df6413263283984bf4c9ef51e371da37fd45f033e8ad28408', 30),
-    'promote/UniVPNPromoteService': ('d36a2e951c52e344a414b449b41f017248d127f1234ac1e83f9b80a290a53c9e', 8),
-    'serviceclient/UniVPNCS': ('426a59bb1342ec5cff995581c9b3d1fbba622b7bcc623dc468a16c9b5b4f19f1', 7),
-}
+SOURCE_FILES = compatibility.SOURCE_FILES
 
 
 class Refused(RuntimeError):
@@ -61,41 +59,50 @@ def replace_at(data, offset, before, after):
     return data[:offset] + after + data[offset + len(before):]
 
 
-def patch(data, relative, number, revision=PATCH_REVISION):
-    """Exact-build profile; offsets are file offsets, not runtime addresses."""
+def binary_architecture(data):
+    if data[:4] in (bytes.fromhex('cafebabe'), bytes.fromhex('cafebabf'),
+                    bytes.fromhex('bebafeca'), bytes.fromhex('bfbafeca')):
+        return 'universal'
+    if data[:4] == bytes.fromhex('cffaedfe') and len(data) >= 8:
+        cpu = struct.unpack_from('<I', data, 4)[0]
+        return {0x01000007: 'x86_64', 0x0100000C: 'arm64'}.get(cpu, 'unknown')
+    return 'unknown'
+
+
+def profile_for_binary(data, relative):
+    """Internal convenience for byte-level tests; App selection checks all files."""
+    matches = [profile for profile in compatibility.BUILD_PROFILES
+               if any(rule.relative == relative and rule.sha256 == digest(data)
+                      for rule in profile.binaries)]
+    if not matches:
+        raise Refused(f'不支持的文件 SHA256：{relative}；未找到已审核的适配规则。')
+    if any(profile.binary(relative) != matches[0].binary(relative)
+           or profile.architecture != matches[0].architecture for profile in matches[1:]):
+        raise Refused('同一文件匹配多份不同规则，拒绝猜测补丁。')
+    return matches[0]
+
+
+def patch(data, relative, number, revision=PATCH_REVISION, profile=None):
+    """Apply only the selected exact-build rule, with every byte guard retained."""
     product = identity(number).encode('ascii')
     if revision not in (1, PATCH_REVISION):
         raise Refused('未知的补丁修订版本。')
-    expected, count = PROFILE[relative]
-    if digest(data) != expected:
+    profile = profile or profile_for_binary(data, relative)
+    rule = profile.binary(relative)
+    if digest(data) != rule.sha256:
         raise Refused(f'不支持的文件 SHA256：{relative}；不能只凭版本号应用补丁。')
-    if data[:8] != bytes.fromhex('cffaedfe07000001'):
-        raise Refused('仅支持本配置记录的 x86_64 Mach-O。')
-    if data.count(b'UniVPN') != count:
+    if profile.architecture != 'x86_64' or binary_architecture(data) != profile.architecture:
+        raise Refused('当前补丁引擎仅支持规则中已审核的 x86_64 Mach-O。')
+    if data.count(b'UniVPN') != rule.identity_count:
         raise Refused('产品身份字符串数量不符。')
     result = data.replace(b'UniVPN', product)
     assigned = ports(number)
-    rpc = struct.pack('<I', assigned['rpc'])
-    backend = struct.pack('<I', assigned['backend_initial'])
-    if relative == 'UniVPN':
-        result = replace_at(result, 0xF5DC8, bytes.fromhex('c745b407720000'), b'\xc7\x45\xb4' + rpc)
-        result = replace_at(result, 0xF5E79, bytes.fromhex('bf07720000'), b'\xbf' + rpc)
-        result = replace_at(result, 0xF7F4C, bytes.fromhex('bf08720000'), b'\xbf' + struct.pack('<I', assigned['plugin_initial']))
-        if revision >= 2:
-            # Rosetta cold start can take >1 second. The vendor tries only at t=0 and t=1.
-            result = replace_at(result, 0xF5E6F, bytes.fromhex('837db002'), bytes.fromhex('837db00f'))
-            # After those retries, do not scan the vendor's old 29191..29195 range.
-            result = replace_at(result, 0xF5EF4, bytes.fromhex('817db40c720000'), b'\x81\x7d\xb4' + rpc)
-        # Keep the vendor ownership check; require root:wheel 04755 instead of 04777.
-        result = replace_at(result, 0xF3520, bytes.fromhex('48817dd0ff090000'), bytes.fromhex('48817dd0ed090000'))
-        result = replace_at(result, 0x206E90, b'04777', b'04755')
-        result = replace_at(result, 0x206EA9, b'04777', b'00755')
-    elif relative.startswith('promote/'):
-        result = replace_at(result, 0x57C6, bytes.fromhex('bf07720000'), b'\xbf' + rpc)
-    else:
-        result = replace_at(result, 0x11853, bytes.fromhex('c745c0744a0000'), b'\xc7\x45\xc0' + backend)
-        # Two per-client PAC basenames. Leave unrelated protocol/crypto strings alone.
-        if result.count(b'univpn') != 2:
+    for edit in rule.edits:
+        if edit.since_revision <= revision:
+            after = edit.prefix + struct.pack('<I', assigned[edit.port]) if edit.port else edit.after
+            result = replace_at(result, edit.offset, edit.before, after)
+    if rule.pac_count:
+        if result.count(b'univpn') != rule.pac_count:
             raise Refused('PAC 文件名数量不符。')
         result = result.replace(b'univpn', product.lower())
     if len(result) != len(data) or b'UniVPN' in result:
@@ -103,22 +110,102 @@ def patch(data, relative, number, revision=PATCH_REVISION):
     return result
 
 
-def read_source(source):
+def source_file(source, relative):
+    """Read only regular files through real directories within the App."""
+    path = source / relative
+    for parent in path.parents:
+        if parent.is_symlink():
+            raise Refused(f'源文件路径包含符号链接：{relative}')
+        if parent == source:
+            break
+    if path.is_symlink() or not path.is_file():
+        raise Refused(f'源文件缺失或不是普通文件：{relative}')
+    return path.read_bytes()
+
+
+def inspect_source(source):
+    """Collect non-secret metadata, then match one whole reviewed build in memory."""
     if source.is_symlink() or not source.is_dir():
         raise Refused('源 App 必须是实际目录。')
-    with (source / 'Contents/Info.plist').open('rb') as f:
-        info = plistlib.load(f)
-    if info.get('CFBundleShortVersionString') != VERSION:
-        raise Refused('源 App 版本不匹配。')
-    result = {}
-    for relative in PROFILE:
-        path = source / 'Contents/MacOS' / relative
-        if path.is_symlink() or not path.is_file():
-            raise Refused(f'源可执行文件不是普通文件：{relative}')
-        data = path.read_bytes()
-        patch(data, relative, 2)  # Includes every byte/count guard, in memory only.
-        result[relative] = data
-    return result
+    try:
+        info = plistlib.loads(source_file(source, 'Contents/Info.plist'))
+    except (plistlib.InvalidFileException, ValueError, TypeError, ExpatError):
+        raise Refused('源 App 的 Info.plist 无法解析。') from None
+    if not isinstance(info, dict):
+        raise Refused('源 App 的 Info.plist 不是字典。')
+    version = info.get('CFBundleShortVersionString', '')
+    if not isinstance(version, str):
+        version = ''
+    bundle_version = info.get('CFBundleVersion', '')
+    report = {'version': version, 'bundle_version': bundle_version if isinstance(bundle_version, str) else '',
+              'architecture': 'unknown', 'supported': False, 'profile': None,
+              'reason': '', 'sha256': {}, 'binaries': {}}
+    originals = {}
+    for relative in SOURCE_FILES:
+        try:
+            data = source_file(source, 'Contents/MacOS/' + relative)
+        except (Refused, OSError):
+            report['binaries'][relative] = {'error': '文件缺失、不可读或路径类型不受支持'}
+            continue
+        originals[relative] = data
+        report['sha256'][relative] = digest(data)
+        report['binaries'][relative] = {'sha256': digest(data), 'architecture': binary_architecture(data)}
+    architectures = {item.get('architecture', 'unknown') for item in report['binaries'].values()}
+    report['architecture'] = next(iter(architectures)) if len(architectures) == 1 else 'mixed'
+    candidates = [profile for profile in compatibility.BUILD_PROFILES if version in profile.versions]
+    matches = [profile for profile in candidates if report['sha256'] == profile.hashes()
+               and report['architecture'] == profile.architecture
+               and info.get('CFBundleIdentifier') == profile.bundle_id
+               and info.get('CFBundleExecutable') == profile.executable]
+    if len(originals) != len(SOURCE_FILES):
+        reason = '客户端组件缺失或布局不兼容，请查看 binaries 中的文件检查结果。'
+    elif report['architecture'] != 'x86_64':
+        reason = f'暂不支持 {report["architecture"]} 架构的补丁；不会套用 x86_64 规则。'
+    elif not version:
+        reason = '客户端未提供有效版本号，无法选择适配规则。'
+    elif not candidates:
+        reason = f'尚未适配此版本 {version}；请保留检查报告，等待增加已验证规则。'
+    elif not matches:
+        reason = '版本号已识别，但核心 SHA256 或 Bundle 身份不匹配，可能是其他构建或混合组件。'
+    elif len(matches) != 1:
+        reason = '同时匹配多份适配规则，拒绝猜测。'
+    else:
+        profile = matches[0]
+        try:
+            for relative, data in originals.items():
+                patch(data, relative, 2, profile=profile)
+        except (Refused, KeyError, StopIteration) as error:
+            reason = f'规则 {profile.id} 的补丁前置检查失败：{error}'
+        else:
+            report.update(supported=True, profile=profile.id, reason='已匹配已审核规则，所有补丁前置检查通过。')
+            return report, originals, profile
+    report['reason'] = reason
+    return report, originals, None
+
+
+def require_source(source):
+    report, originals, profile = inspect_source(source)
+    if profile is None:
+        raise Refused(f'无法自动适配 UniVPN {report["version"] or "未知版本"} '
+                      f'({report["architecture"]})：{report["reason"]} '
+                      '未生成、安装或修改客户端；可运行 inspect 查看只读报告。')
+    return originals, profile, report
+
+
+def read_source(source):
+    return require_source(source)[0]
+
+
+def manifest_profile(manifest):
+    """Infer old records too, but never trust an arbitrary profile ID alone."""
+    matches = [profile for profile in compatibility.BUILD_PROFILES
+               if manifest.get('version') in profile.versions
+               and manifest.get('source_sha256') == profile.hashes()
+               and manifest.get('source_profile', profile.id) == profile.id
+               and manifest.get('architecture', profile.architecture) == profile.architecture]
+    if len(matches) != 1:
+        raise Refused('副本的来源构建未匹配唯一的已审核规则，拒绝修改或启动。')
+    return matches[0]
 
 
 def tree_record(app, installed=False):
@@ -160,6 +247,7 @@ def load_manifest(app, installed=False):
         raise Refused('实例 App 不能重命名。')
     if manifest.get('ports') != ports(manifest['number']):
         raise Refused('端口记录不符。')
+    manifest_profile(manifest)
     actual_files = tree_record(app, installed)
     expected_files = dict(manifest['files'])
     if installed:
@@ -186,7 +274,8 @@ def build(args):
         raise Refused('请以普通用户生成副本；只有安装步骤使用 sudo。')
     product = identity(args.number)
     source = args.source.absolute()
-    originals = read_source(source)
+    originals, profile, report = require_source(source)
+    template = normalize_reconnect_timer(source_file(source, RUNTIME_CONFIG))
     tree_record(source)  # Validate every link before copying.
     output = args.output.absolute()
     if output.resolve().is_relative_to(source.resolve()):
@@ -208,14 +297,14 @@ def build(args):
     binaries = {}
     for relative, data in originals.items():
         changed = relative.replace('UniVPN', product)
-        payload = patch(data, relative, args.number)
+        payload = patch(data, relative, args.number, profile=profile)
         dest = app / 'Contents/MacOS' / changed
         dest.write_bytes(payload)
         binaries[dest.relative_to(app).as_posix()] = digest(payload)
     # The installed vendor template uses 0, but the backend's reader accepts 1..1440.
     # An invalid timer makes it recreate the user INI, discarding every SessionN entry.
     config = app / RUNTIME_CONFIG
-    config.write_bytes(normalize_reconnect_timer(config.read_bytes()))
+    config.write_bytes(template)
     plist = app / 'Contents/Info.plist'
     with plist.open('rb') as f:
         info = plistlib.load(f)
@@ -233,7 +322,8 @@ def build(args):
         path.chmod(0o755 if path.is_dir() or executable else 0o644)
     (app / 'Contents/MacOS' / product).chmod(0o644)
     manifest = {
-        'schema': 1, 'number': args.number, 'product': product, 'version': VERSION,
+        'schema': 1, 'number': args.number, 'product': product, 'version': report['version'],
+        'source_profile': profile.id, 'architecture': profile.architecture,
         'patch_revision': PATCH_REVISION,
         'validation': 'offline-only; no VPN login or dual-tunnel verification',
         'ports': ports(args.number),
@@ -332,10 +422,10 @@ def clean_orphan_helper(app, product):
         time.sleep(0.1)
 
 
-def repair_payload(original, current, number, revision):
-    if current != patch(original, 'UniVPN', number, revision=revision):
+def repair_payload(original, current, number, revision, profile=None):
+    if current != patch(original, 'UniVPN', number, revision=revision, profile=profile):
         raise Refused('已安装界面不符合该修订版本的精确补丁，拒绝修复。')
-    return patch(original, 'UniVPN', number)
+    return patch(original, 'UniVPN', number, profile=profile)
 
 
 def atomic_write(path, payload, mode):
@@ -514,10 +604,13 @@ def repair(args):
     if revision == PATCH_REVISION:
         print('副本已是修复版，无需再次修改。')
         return
-    original = read_source(SOURCE)['UniVPN']
+    originals, profile, _ = require_source(SOURCE)
+    if profile.id != manifest_profile(manifest).id:
+        raise Refused('原版已更换构建，与待修复副本来源不同，未套用其他版本补丁。')
+    original = originals['UniVPN']
     ui = app / 'Contents/MacOS' / product
     previous_ui = ui.read_bytes()
-    updated = repair_payload(original, previous_ui, args.number, revision)
+    updated = repair_payload(original, previous_ui, args.number, revision, profile=profile)
     marker = app / MARKER
     previous_marker = marker.read_bytes()
     clean_orphan_helper(app, product)
@@ -535,7 +628,7 @@ def repair(args):
     print(f'已修复 {product}：RPC 重试增加到 15 次，停止扫描旧端口。\n未启动客户端；用户配置保持不变。')
 
 
-def select_new_instance(applications=Path('/Applications')):
+def select_new_instance(applications=Path('/Applications'), profile_id=None):
     """Prefer the idle original, then idle installed copies, then a free identity."""
     original = applications / 'UniVPN.app'
     if original.is_symlink() or not original.is_dir():
@@ -550,7 +643,9 @@ def select_new_instance(applications=Path('/Applications')):
             found = checked_processes(app, product)
             if found['ui'] or found['backend']:
                 continue
-            load_manifest(app, installed=True)
+            manifest = load_manifest(app, installed=True)
+            if profile_id is not None and manifest_profile(manifest).id != profile_id:
+                continue
             return number, app
         if unused is None and not any(checked_processes(app, product).values()):
             unused = (number, app)
@@ -775,14 +870,18 @@ def ensure_gateway_protection():
 def new_window(args):
     if os.geteuid() == 0:
         raise Refused('请直接运行 new，不要加 sudo；需要安装时命令会自行调用 sudo。')
+    # Resolve before the lock directory, config writes, route checks or sudo calls.
+    # Even opening the original must not silently skip compatibility detection.
+    _, profile, report = require_source(SOURCE)
+    print(f'已识别 UniVPN {report["version"]} ({profile.architecture})；适配规则：{profile.id}')
     output = Path(__file__).resolve().parent / 'build'
     if args.dry_run:
-        number, app = select_new_instance()
+        number, app = select_new_instance(profile_id=profile.id)
         action = '打开原版' if number == 1 else ('复用已安装副本' if app.exists() else '生成、安装并打开新副本')
         print(f'计划：{action} {app}；未修改文件或启动客户端。')
         return
     with new_window_lock(output):
-        number, app = select_new_instance()
+        number, app = select_new_instance(profile_id=profile.id)
         if number == 1:
             ensure_gateway_protection()
             if any(checked_processes(app, 'UniVPN').values()):
@@ -802,7 +901,9 @@ def new_window(args):
                 if staged.parent.exists():
                     raise Refused(f'存在未完成的生成目录：{staged.parent}；请先检查，未自动删除。')
                 build(argparse.Namespace(number=number, source=SOURCE, output=output))
-            load_manifest(staged)
+            staged_manifest = load_manifest(staged)
+            if manifest_profile(staged_manifest).id != profile.id:
+                raise Refused('已有生成目录来自不同客户端构建，未覆盖或安装；请先检查该目录。')
             print('首次使用此副本需要安装；请在终端输入 Mac 管理员密码。', flush=True)
             subprocess.run(['/usr/bin/sudo', sys.executable, str(Path(__file__).resolve()),
                             'install', str(staged)], check=True)
@@ -866,7 +967,8 @@ def start(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    inspect = sub.add_parser('inspect', help='只读校验源 App 和内存补丁')
+    sub.add_parser('profiles', help='列出内置已审核版本和构建规则，不读取客户端或配置')
+    inspect = sub.add_parser('inspect', help='只读识别版本、架构和适配规则；不兼容时返回非零状态')
     inspect.add_argument('--source', type=Path, default=SOURCE)
     create = sub.add_parser('build', help='只生成离线副本，不安装或启动')
     create.add_argument('--source', type=Path, default=SOURCE)
@@ -886,12 +988,17 @@ def main():
     cfg = sub.add_parser('repair-config', help='同步修复两份系统配置、索引及校验值；需要 sudo')
     cfg.add_argument('--number', type=int, default=2)
     args = parser.parse_args()
+    if args.command == 'profiles':
+        print(json.dumps([{'id': profile.id, 'versions': profile.versions,
+                           'architecture': profile.architecture, 'sha256': profile.hashes()}
+                          for profile in compatibility.BUILD_PROFILES], ensure_ascii=False, indent=2))
+        return 0
     if sys.platform != 'darwin':
         raise Refused('此工具仅支持 macOS。')
     if args.command == 'inspect':
-        originals = read_source(args.source)
-        print(json.dumps({'version': VERSION, 'architecture': 'x86_64 (Apple Silicon requires Rosetta)',
-                          'supported': True, 'sha256': {k: digest(v) for k, v in originals.items()}}, indent=2))
+        report, _, _ = inspect_source(args.source)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report['supported'] else 1
     elif args.command == 'build':
         build(args)
     elif args.command == 'verify':
@@ -911,7 +1018,7 @@ def main():
 
 if __name__ == '__main__':
     try:
-        main()
+        sys.exit(main())
     except (Refused, OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
         print(f'停止：{error}', file=sys.stderr)
         sys.exit(1)
