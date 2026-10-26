@@ -195,6 +195,19 @@ class NewWindowTests(unittest.TestCase):
                 tool.ensure_gateway_protection()
                 run.assert_not_called()
 
+    def test_new_window_refreshes_stale_routes_even_when_none_are_missing(self):
+        import gateway_routes as gateway
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / '.UniVPN/config'
+            directory.mkdir(parents=True)
+            (directory / 'test.ini').write_text('[GLOBAL]\nGatewayAddress = 8.8.8.8\n')
+            with mock.patch.object(tool.Path, 'home', return_value=Path(tmp)), \
+                    mock.patch.object(gateway, 'inspect_plan', return_value=([], {}, [{'add': False, 'refresh': True}])), \
+                    mock.patch.object(tool.subprocess, 'run') as run:
+                tool.ensure_gateway_protection()
+                self.assertEqual(run.call_args.args[0][0], '/usr/bin/sudo')
+                self.assertEqual(run.call_args.args[0][-1], 'protect')
+
 
 class InheritOriginalTests(unittest.TestCase):
     profile = b'[GLOBAL]\niConnectionType = 1\nGatewayAddress = 192.0.2.1\nGatewayPort = 443\n'

@@ -849,7 +849,7 @@ def inherit_original_config(app, number, overwrite=False):
 
 
 def ensure_gateway_protection():
-    """Fill missing public-gateway fallbacks before any new client can connect."""
+    """Add missing fallbacks and refresh owned routes after a network change."""
     directory = Path.home() / '.UniVPN/config'
     if not directory.exists() or not any(directory.glob('*.ini')):
         return
@@ -859,8 +859,8 @@ def ensure_gateway_protection():
         _, _, plan = gateway.inspect_plan(Path.home())
     except gateway.Refused as error:
         raise Refused(f'网关出口检查失败：{error}') from None
-    if any(item['add'] for item in plan):
-        print('需要补充已保存网关的物理出口保护；请按终端提示输入 Mac 管理员密码。', flush=True)
+    if any(item['add'] or item.get('refresh') for item in plan):
+        print('需要补充或更新已保存网关的物理出口保护；请按终端提示输入 Mac 管理员密码。', flush=True)
         subprocess.run(['/usr/bin/sudo', sys.executable, str(Path(__file__).resolve().with_name('gateway_routes.py')),
                         'protect'], check=True)
     else:
